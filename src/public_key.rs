@@ -1,16 +1,27 @@
+#[cfg(feature = "dns")]
 use base64::{engine::general_purpose, Engine};
+#[cfg(feature = "dns")]
 use rsa::{pkcs1, pkcs8};
+#[cfg(feature = "dns")]
 use slog::{debug, warn};
+#[cfg(feature = "dns")]
 use std::collections::HashMap;
+#[cfg(feature = "dns")]
 use std::sync::Arc;
 
-use crate::{dns, parser, DKIMError, DkimPublicKey, DNS_NAMESPACE};
+#[cfg(feature = "dns")]
+use crate::dns;
+#[cfg(feature = "dns")]
+use crate::{parser, DKIMError, DkimPublicKey, DNS_NAMESPACE};
 
+#[cfg(feature = "dns")]
 const RSA_KEY_TYPE: &str = "rsa";
+#[cfg(feature = "dns")]
 const ED25519_KEY_TYPE: &str = "ed25519";
 
 // https://datatracker.ietf.org/doc/html/rfc6376#section-6.1.2
-pub(crate) async fn retrieve_public_key(
+#[cfg(feature = "dns")]
+pub async fn retrieve_public_key(
     logger: &slog::Logger,
     resolver: Arc<dyn dns::Lookup>,
     domain: String,

@@ -3,6 +3,8 @@
 use base64::engine::general_purpose;
 use base64::Engine;
 use indexmap::map::IndexMap;
+use rsa::pkcs1;
+use rsa::pkcs1::EncodeRsaPublicKey;
 use rsa::Pkcs1v15Sign;
 use rsa::RsaPrivateKey;
 use rsa::RsaPublicKey;
@@ -11,7 +13,9 @@ use sha2::Sha256;
 use slog::debug;
 use std::array::TryFromSliceError;
 use std::collections::HashSet;
+#[cfg(feature = "dns")]
 use std::sync::Arc;
+#[cfg(feature = "dns")]
 use trust_dns_resolver::TokioAsyncResolver;
 
 use mailparse::MailHeaderMap;
@@ -21,12 +25,13 @@ extern crate quick_error;
 
 mod bytes;
 pub mod canonicalization;
+#[cfg(feature = "dns")]
 pub mod dns;
 mod errors;
 mod hash;
-mod header;
+pub mod header;
 mod parser;
-mod public_key;
+pub mod public_key;
 mod result;
 #[cfg(test)]
 mod roundtrip_test;
@@ -39,13 +44,73 @@ pub use parser::Tag;
 pub use result::DKIMResult;
 pub use sign::{DKIMSigner, SignerBuilder};
 
+#[cfg(feature = "time")]
 const SIGN_EXPIRATION_DRIFT_MINS: i64 = 15;
+#[cfg(feature = "dns")]
 const DNS_NAMESPACE: &str = "_domainkey";
 
 #[derive(Debug)]
-pub(crate) enum DkimPublicKey {
+pub enum DkimPublicKey {
     Rsa(RsaPublicKey),
     Ed25519(ed25519_dalek::VerifyingKey),
+}
+
+impl DkimPublicKey {
+    pub fn to_vec(&self) -> Vec<u8> {
+        match self {
+            DkimPublicKey::Ed25519(public_key) => public_key.as_bytes().to_vec(),
+            DkimPublicKey::Rsa(public_key) => public_key
+                .to_pkcs1_der()
+                .expect("RSA key serialization should not fail")
+                .to_vec(),
+        }
+    }
+
+    /// Returns the key type
+    pub fn key_type(&self) -> &'static str {
+        match self {
+            DkimPublicKey::Ed25519(_) => "ed25519",
+            DkimPublicKey::Rsa(_) => "rsa",
+        }
+    }
+
+    /// Try to create a DkimPublicKey from bytes and key type
+    pub fn try_from_bytes(bytes: &[u8], key_type: &str) -> Result<Self, DKIMError> {
+        match key_type.to_lowercase().as_str() {
+            "rsa" => Self::parse_rsa_key(bytes),
+            "ed25519" => Self::parse_ed25519_key(bytes),
+            unsupported => Err(DKIMError::KeyUnavailable(format!(
+                "unsupported key type: {}",
+                unsupported
+            ))),
+        }
+    }
+
+    fn parse_rsa_key(bytes: &[u8]) -> Result<Self, DKIMError> {
+        pkcs1::DecodeRsaPublicKey::from_pkcs1_der(bytes)
+            .map(DkimPublicKey::Rsa)
+            .map_err(|err| DKIMError::KeyUnavailable(format!("failed to parse RSA key: {}", err)))
+    }
+
+    fn parse_ed25519_key(bytes: &[u8]) -> Result<Self, DKIMError> {
+        let key_bytes: [u8; 32] = bytes.try_into().map_err(|err| {
+            DKIMError::KeyUnavailable(format!("invalid Ed25519 key length: {}", err))
+        })?;
+
+        ed25519_dalek::VerifyingKey::from_bytes(&key_bytes)
+            .map(DkimPublicKey::Ed25519)
+            .map_err(|err| {
+                DKIMError::KeyUnavailable(format!("failed to parse Ed25519 key: {}", err))
+            })
+    }
+}
+
+impl TryFrom<(&[u8], &str)> for DkimPublicKey {
+    type Error = DKIMError;
+
+    fn try_from((bytes, key_type): (&[u8], &str)) -> Result<Self, Self::Error> {
+        Self::try_from_bytes(bytes, key_type)
+    }
 }
 
 #[derive(Debug)]
@@ -55,7 +120,7 @@ pub enum DkimPrivateKey {
 }
 
 // https://datatracker.ietf.org/doc/html/rfc6376#section-6.1.1
-fn validate_header(value: &str) -> Result<DKIMHeader, DKIMError> {
+pub fn validate_header(value: &str) -> Result<DKIMHeader, DKIMError> {
     let (_, tags) =
         parser::tag_list(value).map_err(|err| DKIMError::SignatureSyntaxError(err.to_string()))?;
 
@@ -117,7 +182,14 @@ fn validate_header(value: &str) -> Result<DKIMHeader, DKIMError> {
     }
 
     // Check that "x=" tag isn't expired
+    // NOTE: RFC 6376 section 3.5, the "x=" tag is RECOMMENDED (not REQUIRED) with
+    // "Signatures MAY be considered invalid if the verification time at the Verifier
+    // is past the expiration date...The "x=" tag is not intended as an anti-replay
+    // defense." Since the RFC explicitly makes this validation optional, not checking
+    // expiry when the "time" feature is disabled does not violate the specification.
+    #[cfg(feature = "time")]
     if let Some(expiration) = header.get_tag("x") {
+        #[allow(deprecated)]
         let mut expiration = chrono::NaiveDateTime::from_timestamp_opt(
             expiration.parse::<i64>().unwrap_or_default(),
             0,
@@ -163,6 +235,7 @@ fn verify_signature(
     })
 }
 
+#[cfg(feature = "dns")]
 async fn verify_email_header<'a>(
     logger: &'a slog::Logger,
     resolver: Arc<dyn dns::Lookup>,
@@ -214,6 +287,7 @@ async fn verify_email_header<'a>(
 }
 
 /// Run the DKIM verification on the email providing an existing resolver
+#[cfg(feature = "dns")]
 pub async fn verify_email_with_resolver<'a>(
     logger: &slog::Logger,
     from_domain: &str,
@@ -265,6 +339,7 @@ pub async fn verify_email_with_resolver<'a>(
 }
 
 /// Run the DKIM verification on the email
+#[cfg(feature = "dns")]
 pub async fn verify_email<'a>(
     logger: &slog::Logger,
     from_domain: &str,
@@ -278,8 +353,101 @@ pub async fn verify_email<'a>(
     verify_email_with_resolver(logger, from_domain, email, resolver).await
 }
 
+pub fn verify_email_with_key<'a>(
+    logger: &slog::Logger,
+    from_domain: &str,
+    email: &'a mailparse::ParsedMail<'a>,
+    public_key: DkimPublicKey,
+) -> Result<DKIMResult, DKIMError> {
+    let mut last_error = None;
+
+    for h in email.headers.get_all_headers(HEADER) {
+        let value = String::from_utf8_lossy(h.get_value_raw());
+        debug!(logger, "checking signature {:?}", value);
+
+        let dkim_header = match validate_header(&value) {
+            Ok(v) => v,
+            Err(err) => {
+                debug!(logger, "failed to verify: {}", err);
+                last_error = Some(err);
+                continue;
+            }
+        };
+
+        // select the signature corresponding to the email sender
+        let signing_domain = dkim_header.get_required_tag("d");
+        if signing_domain.to_lowercase() != from_domain.to_lowercase() {
+            // CHECK!
+            continue;
+        }
+
+        let (header_canon_type, body_canon_type) =
+            parser::parse_canonicalization(dkim_header.get_tag("c"))?;
+        let hash_algo = parser::parse_hash_algo(&dkim_header.get_required_tag("a"))?;
+
+        let computed_body_hash = hash::compute_body_hash(
+            body_canon_type.clone(),
+            dkim_header.get_tag("l"),
+            hash_algo.clone(),
+            email,
+        )?;
+
+        let computed_header_hash = hash::compute_headers_hash(
+            logger,
+            header_canon_type.clone(),
+            &dkim_header.get_required_tag("h"),
+            hash_algo.clone(),
+            &dkim_header,
+            email,
+        )?;
+
+        debug!(logger, "body_hash {:?}", computed_body_hash);
+
+        let header_body_hash = dkim_header.get_required_tag("bh");
+
+        if header_body_hash != computed_body_hash {
+            return Err(DKIMError::BodyHashDidNotVerify);
+        }
+
+        let signature = general_purpose::STANDARD
+            .decode(dkim_header.get_required_tag("b"))
+            .map_err(|err| {
+                DKIMError::SignatureSyntaxError(format!("failed to decode signature: {}", err))
+            })?;
+
+        if !verify_signature(hash_algo, computed_header_hash, signature, public_key)? {
+            return Err(DKIMError::SignatureDidNotVerify);
+        }
+
+        return Ok(DKIMResult::pass(
+            signing_domain,
+            header_canon_type,
+            body_canon_type,
+        ));
+    }
+
+    if let Some(err) = last_error {
+        Ok(DKIMResult::fail(err, from_domain.to_owned()))
+    } else {
+        Ok(DKIMResult::neutral(from_domain.to_owned()))
+    }
+}
+
+/// Run the DKIM verification on the email with a provided public key when DNS feature is disabled
+#[cfg(not(feature = "dns"))]
+pub fn verify_email<'a>(
+    logger: &slog::Logger,
+    from_domain: &str,
+    email: &'a mailparse::ParsedMail<'a>,
+    public_key: DkimPublicKey,
+) -> Result<DKIMResult, DKIMError> {
+    verify_email_with_key(logger, from_domain, email, public_key)
+}
+
 #[cfg(test)]
 mod tests {
+    use pkcs1::DecodeRsaPublicKey;
+
     use crate::dns::Lookup;
 
     use super::*;
@@ -493,5 +661,115 @@ Joe.
         .await;
 
         assert!(dkim_verify_result.is_ok());
+    }
+
+    #[test]
+    fn test_invalid_key_type() {
+        let result = DkimPublicKey::try_from_bytes(&[0u8; 32], "invalid");
+        assert!(matches!(result, Err(DKIMError::KeyUnavailable(_))));
+    }
+
+    #[test]
+    fn test_invalid_ed25519_key() {
+        let result = DkimPublicKey::try_from_bytes(&[0u8; 31], "ed25519");
+        assert!(matches!(result, Err(DKIMError::KeyUnavailable(_))));
+    }
+
+    #[test]
+    fn test_key_type() {
+        // RSA key from "newengland._domainkey.example.com" test data
+        let rsa_data = general_purpose::STANDARD
+        .decode("MIGJAoGBALVI635dLK4cJJAH3Lx6upo3X/Lm1tQz3mezcWTA3BUBnyIsdnRf57aD5BtNmhPrYYDlWlzw3UgnKisIxktkk5+iMQMlFtAS10JB8L3YadXNJY+JBcbeSi5TgJe4WFzNgW95FWDAuSTRXSWZfA/8xjflbTLDx0euFZOM7C4T0GwLAgMBAAE=")
+        .unwrap();
+        let rsa_key = DkimPublicKey::Rsa(RsaPublicKey::from_pkcs1_der(&rsa_data).unwrap());
+        assert_eq!(rsa_key.key_type(), "rsa");
+
+        // Ed25519 key from "brisbane._domainkey.football.example.com" test data
+        let ed25519_data: [u8; 32] = general_purpose::STANDARD
+            .decode("11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let ed_key =
+            DkimPublicKey::Ed25519(ed25519_dalek::VerifyingKey::from_bytes(&ed25519_data).unwrap());
+        assert_eq!(ed_key.key_type(), "ed25519");
+    }
+
+    #[test]
+    fn test_verify_email_with_rsa_key() {
+        let raw_email =
+            r#"DKIM-Signature: a=rsa-sha256; bh=2jUSOH9NhtVGCQWNr9BrIAPreKQjO6Sn7XIkfJVOzv8=;
+ c=simple/simple; d=example.com;
+ h=Received:From:To:Subject:Date:Message-ID; i=joe@football.example.com;
+ s=newengland; t=1615825284; v=1;
+ b=Xh4Ujb2wv5x54gXtulCiy4C0e+plRm6pZ4owF+kICpYzs/8WkTVIDBrzhJP0DAYCpnL62T0G
+ k+0OH8pi/yqETVjKtKk+peMnNvKkut0GeWZMTze0bfq3/JUK3Ln3jTzzpXxrgVnvBxeY9EZIL4g
+ s4wwFRRKz/1bksZGSjD8uuSU=
+Received: from client1.football.example.com  [192.0.2.1]
+      by submitserver.example.com with SUBMISSION;
+      Fri, 11 Jul 2003 21:01:54 -0700 (PDT)
+From: Joe SixPack <joe@football.example.com>
+To: Suzie Q <suzie@shopping.example.net>
+Subject: Is dinner ready?
+Date: Fri, 11 Jul 2003 21:00:37 -0700 (PDT)
+Message-ID: <20030712040037.46341.5F8J@football.example.com>
+
+Hi.
+
+We lost the game. Are you hungry yet?
+
+Joe.
+"#
+            .replace('\n', "\r\n");
+
+        let email = mailparse::parse_mail(raw_email.as_bytes()).unwrap();
+
+        let rsa_data = general_purpose::STANDARD
+            .decode("MIGJAoGBALVI635dLK4cJJAH3Lx6upo3X/Lm1tQz3mezcWTA3BUBnyIsdnRf57aD5BtNmhPrYYDlWlzw3UgnKisIxktkk5+iMQMlFtAS10JB8L3YadXNJY+JBcbeSi5TgJe4WFzNgW95FWDAuSTRXSWZfA/8xjflbTLDx0euFZOM7C4T0GwLAgMBAAE=")
+            .unwrap();
+        let public_key = DkimPublicKey::try_from_bytes(&rsa_data, "rsa").unwrap();
+
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
+
+        let result = verify_email_with_key(&logger, "example.com", &email, public_key).unwrap();
+
+        assert_eq!(result.with_detail(), "pass");
+    }
+
+    #[test]
+    fn test_verify_email_with_ed25519_key() {
+        let raw_email = r#"DKIM-Signature: v=1; a=ed25519-sha256; c=relaxed/relaxed;
+ d=football.example.com; i=@football.example.com;
+ q=dns/txt; s=brisbane; t=1528637909; h=from : to :
+ subject : date : message-id : from : subject : date;
+ bh=2jUSOH9NhtVGCQWNr9BrIAPreKQjO6Sn7XIkfJVOzv8=;
+ b=/gCrinpcQOoIfuHNQIbq4pgh9kyIK3AQUdt9OdqQehSwhEIug4D11Bus
+ Fa3bT3FY5OsU7ZbnKELq+eXdp1Q1Dw==
+From: Joe SixPack <joe@football.example.com>
+To: Suzie Q <suzie@shopping.example.net>
+Subject: Is dinner ready?
+Date: Fri, 11 Jul 2003 21:00:37 -0700 (PDT)
+Message-ID: <20030712040037.46341.5F8J@football.example.com>
+
+Hi.
+
+We lost the game. Are you hungry yet?
+
+Joe."#
+            .replace('\n', "\r\n");
+
+        let email = mailparse::parse_mail(raw_email.as_bytes()).unwrap();
+
+        let ed25519_data = general_purpose::STANDARD
+            .decode("11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=")
+            .unwrap();
+        let public_key = DkimPublicKey::try_from_bytes(&ed25519_data, "ed25519").unwrap();
+
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
+
+        let result =
+            verify_email_with_key(&logger, "football.example.com", &email, public_key).unwrap();
+
+        assert_eq!(result.with_detail(), "pass");
     }
 }

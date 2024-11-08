@@ -19,7 +19,7 @@ impl DKIMHeader {
         self.tags.get(name).map(|v| v.raw_value.clone())
     }
 
-    pub(crate) fn get_required_tag(&self, name: &str) -> String {
+    pub fn get_required_tag(&self, name: &str) -> String {
         // Required tags are guaranteed by the parser to be present so it's safe
         // to assert and unwrap.
         debug_assert!(REQUIRED_TAGS.contains(&name));
@@ -43,6 +43,7 @@ fn serialize(header: DKIMHeader) -> String {
 #[derive(Clone)]
 pub(crate) struct DKIMHeaderBuilder {
     header: DKIMHeader,
+    #[cfg(feature = "time")]
     time: Option<chrono::DateTime<chrono::offset::Utc>>,
 }
 impl DKIMHeaderBuilder {
@@ -52,6 +53,7 @@ impl DKIMHeaderBuilder {
                 tags: IndexMap::new(),
                 raw_bytes: "".to_owned(),
             },
+            #[cfg(feature = "time")]
             time: None,
         }
     }
@@ -73,6 +75,7 @@ impl DKIMHeaderBuilder {
         self.add_tag("h", &value)
     }
 
+    #[cfg(feature = "time")]
     pub(crate) fn set_expiry(self, duration: chrono::Duration) -> Result<Self, DKIMError> {
         let time = self
             .time
@@ -81,6 +84,7 @@ impl DKIMHeaderBuilder {
         Ok(self.add_tag("x", &expiry.to_string()))
     }
 
+    #[cfg(feature = "time")]
     pub(crate) fn set_time(mut self, time: chrono::DateTime<chrono::offset::Utc>) -> Self {
         self.time = Some(time);
         self.add_tag("t", &time.timestamp().to_string())

@@ -14,10 +14,12 @@ pub struct SignerBuilder<'a> {
     private_key: Option<DkimPrivateKey>,
     selector: Option<&'a str>,
     signing_domain: Option<&'a str>,
+    #[cfg(feature = "time")]
     time: Option<chrono::DateTime<chrono::offset::Utc>>,
     header_canonicalization: canonicalization::Type,
     body_canonicalization: canonicalization::Type,
     logger: Option<&'a slog::Logger>,
+    #[cfg(feature = "time")]
     expiry: Option<chrono::Duration>,
 }
 
@@ -30,7 +32,9 @@ impl<'a> SignerBuilder<'a> {
             selector: None,
             logger: None,
             signing_domain: None,
+            #[cfg(feature = "time")]
             expiry: None,
+            #[cfg(feature = "time")]
             time: None,
 
             header_canonicalization: canonicalization::Type::Simple,
@@ -87,12 +91,14 @@ impl<'a> SignerBuilder<'a> {
     }
 
     /// Specify current time. Mostly used for testing
+    #[cfg(feature = "time")]
     pub fn with_time(mut self, value: chrono::DateTime<chrono::offset::Utc>) -> Self {
         self.time = Some(value);
         self
     }
 
     /// Specify a expiry duration for the signature validity
+    #[cfg(feature = "time")]
     pub fn with_expiry(mut self, value: chrono::Duration) -> Self {
         self.expiry = Some(value);
         self
@@ -126,8 +132,10 @@ impl<'a> SignerBuilder<'a> {
                 .ok_or(BuilderError("missing required logger"))?,
             header_canonicalization: self.header_canonicalization,
             body_canonicalization: self.body_canonicalization,
+            #[cfg(feature = "time")]
             expiry: self.expiry,
             hash_algo,
+            #[cfg(feature = "time")]
             time: self.time,
         })
     }
@@ -147,8 +155,10 @@ pub struct DKIMSigner<'a> {
     header_canonicalization: canonicalization::Type,
     body_canonicalization: canonicalization::Type,
     logger: &'a slog::Logger,
+    #[cfg(feature = "time")]
     expiry: Option<chrono::Duration>,
     hash_algo: hash::HashAlgo,
+    #[cfg(feature = "time")]
     time: Option<chrono::DateTime<chrono::offset::Utc>>,
 }
 
@@ -187,6 +197,7 @@ impl<'a> DKIMSigner<'a> {
     }
 
     fn dkim_header_builder(&self, body_hash: &str) -> Result<DKIMHeaderBuilder, DKIMError> {
+        #[cfg(feature = "time")]
         let now = chrono::offset::Utc::now();
         let hash_algo = match self.hash_algo {
             hash::HashAlgo::RsaSha1 => "rsa-sha1",
@@ -194,6 +205,7 @@ impl<'a> DKIMSigner<'a> {
             hash::HashAlgo::Ed25519Sha256 => "ed25519-sha256",
         };
 
+        #[allow(unused_mut)]
         let mut builder = DKIMHeaderBuilder::new()
             .add_tag("v", "1")
             .add_tag("a", hash_algo)
@@ -209,9 +221,11 @@ impl<'a> DKIMSigner<'a> {
             )
             .add_tag("bh", body_hash)
             .set_signed_headers(self.signed_headers);
+        #[cfg(feature = "time")]
         if let Some(expiry) = self.expiry {
             builder = builder.set_expiry(expiry)?;
         }
+        #[cfg(feature = "time")]
         if let Some(time) = self.time {
             builder = builder.set_time(time);
         } else {
