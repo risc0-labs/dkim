@@ -11,7 +11,7 @@ pub struct DKIMHeader {
 }
 
 impl DKIMHeader {
-    pub(crate) fn get_tag(&self, name: &str) -> Option<String> {
+    pub fn get_tag(&self, name: &str) -> Option<String> {
         self.tags.get(name).map(|v| v.value.clone())
     }
 
